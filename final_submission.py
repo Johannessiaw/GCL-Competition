@@ -156,7 +156,8 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
     cat_test = np.zeros(len(X_test), dtype=float)
     lgb_test = np.zeros(len(X_test), dtype=float)
 
-    for idx_train, idx_valid in cv.split(X, y):
+    fold_scores = []
+    for fold_number, (idx_train, idx_valid) in enumerate(cv.split(X, y), start=1):
         X_train, X_valid = X.iloc[idx_train].copy(), X.iloc[idx_valid].copy()
         y_train, y_valid = y.iloc[idx_train].copy(), y.iloc[idx_valid].copy()
 
@@ -179,8 +180,10 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
             od_wait=60,
         )
         cat_model.fit(X_train, y_train, eval_set=(X_valid, y_valid), early_stopping_rounds=120, verbose=False)
-        cat_oof[idx_valid] = cat_model.predict_proba(X_valid)[:, 1]
+        cat_valid_pred = cat_model.predict_proba(X_valid)[:, 1]
+        cat_oof[idx_valid] = cat_valid_pred
         cat_test += cat_model.predict_proba(X_test)[:, 1] / cv.n_splits
+        cat_fold_auc = roc_auc_score(y_valid, cat_valid_pred)
 
         # Build category maps from this fold's training rows only, then reuse them.
         category_maps = {
@@ -219,8 +222,23 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
             )
         else:
             lgb_model.fit(X_train_lgb, y_train, **fit_kwargs)
-        lgb_oof[idx_valid] = lgb_model.predict_proba(X_valid_lgb)[:, 1]
+        lgb_valid_pred = lgb_model.predict_proba(X_valid_lgb)[:, 1]
+        lgb_oof[idx_valid] = lgb_valid_pred
         lgb_test += lgb_model.predict_proba(X_test_lgb)[:, 1] / cv.n_splits
+        lgb_fold_auc = roc_auc_score(y_valid, lgb_valid_pred)
+        blend_fold_auc = roc_auc_score(y_valid, 0.55 * cat_valid_pred + 0.45 * lgb_valid_pred)
+        fold_scores.append({
+            "fold": fold_number,
+            "catboost_auc": cat_fold_auc,
+            "lightgbm_auc": lgb_fold_auc,
+            "blend_auc": blend_fold_auc,
+        })
+        print(
+            f"Fold {fold_number}/{cv.n_splits} | "
+            f"CatBoost AUC={cat_fold_auc:.6f} | "
+            f"LightGBM AUC={lgb_fold_auc:.6f} | "
+            f"Blend AUC={blend_fold_auc:.6f}"
+        )
 
     cat_auc = roc_auc_score(y, cat_oof)
     lgb_auc = roc_auc_score(y, lgb_oof)
@@ -229,6 +247,11 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
     print(f"Cross-validated CatBoost AUC: {cat_auc:.6f}")
     print(f"Cross-validated LightGBM AUC: {lgb_auc:.6f}")
     print(f"Cross-validated blended AUC: {blended_auc:.6f}")
+    print(
+        "Fold blend AUC range: "
+        f"{min(row['blend_auc'] for row in fold_scores):.6f} - "
+        f"{max(row['blend_auc'] for row in fold_scores):.6f}"
+    )
     return 0.55 * cat_test + 0.45 * lgb_test
 
 
@@ -247,6 +270,11 @@ def main():
     test_df = pd.read_csv(TEST_PATH)
     sample_submission = pd.read_csv(SAMPLE_SUB_PATH)
 
+    if train_df.empty or test_df.empty or sample_submission.empty:
+        raise ValueError("One or more competition CSV files are empty.")
+    if train_df.columns.duplicated().any() or test_df.columns.duplicated().any():
+        raise ValueError("Training or test data contains duplicate column names.")
+
     required_train_columns = {"SK_ID_CURR", "TARGET"}
     if not required_train_columns.issubset(train_df.columns):
         raise ValueError(f"train.csv must contain columns: {sorted(required_train_columns)}")
@@ -254,6 +282,37 @@ def main():
         raise ValueError("test.csv must contain the SK_ID_CURR identifier column")
     if not {"SK_ID_CURR", "TARGET"}.issubset(sample_submission.columns):
         raise ValueError("sample_submission.csv must contain SK_ID_CURR and TARGET columns")
+    if train_df["SK_ID_CURR"].isna().any() or test_df["SK_ID_CURR"].isna().any():
+        raise ValueError("SK_ID_CURR contains missing values.")
+    if train_df["SK_ID_CURR"].duplicated().any() or test_df["SK_ID_CURR"].duplicated().any():
+        raise ValueError("SK_ID_CURR must be unique within train.csv and test.csv.")
+    if train_df["TARGET"].isna().any() or not set(train_df["TARGET"].unique()).issubset({0, 1}):
+        raise ValueError("TARGET must contain only non-missing binary labels 0 and 1.")
+    if not sample_submission.columns.tolist() == ["SK_ID_CURR", "TARGET"]:
+        raise ValueError(
+            "Submission template must contain exactly these columns in order: "
+            "SK_ID_CURR, TARGET."
+        )
+    if len(sample_submission) != len(test_df):
+        raise ValueError("Sample submission and test data have different row counts.")
+    if not sample_submission["SK_ID_CURR"].equals(test_df["SK_ID_CURR"]):
+        raise ValueError("Sample submission IDs do not match test data IDs in order.")
+
+    train_features = set(train_df.columns) - {"TARGET", "SK_ID_CURR"}
+    test_features = set(test_df.columns) - {"SK_ID_CURR"}
+    missing_test = sorted(train_features - test_features)
+    extra_test = sorted(test_features - train_features)
+    if missing_test or extra_test:
+        raise ValueError(
+            "Train/test feature mismatch. "
+            f"Missing from test: {missing_test[:10]}; "
+            f"extra in test: {extra_test[:10]}"
+        )
+
+    print(f"Training rows: {len(train_df):,}; test rows: {len(test_df):,}")
+    print(f"Input feature columns: {len(train_features):,}")
+    print(f"Default rate: {train_df['TARGET'].mean():.6%}")
+    print("Validation: 5-fold stratified CV, shuffle=True, random_state=42")
 
     train_df = add_engineered_features(train_df)
     test_df = add_engineered_features(test_df)
@@ -261,10 +320,8 @@ def main():
     X, y, X_test, cat_features = prepare_model_data(train_df, test_df)
     probs = fit_blended_models(X, y, X_test, cat_features)
 
-    if len(sample_submission) != len(test_df):
-        raise ValueError("Sample submission and test data have different row counts.")
-    if not sample_submission["SK_ID_CURR"].equals(test_df["SK_ID_CURR"]):
-        raise ValueError("Sample submission IDs do not match test data IDs in order.")
+    if len(probs) != len(test_df):
+        raise ValueError("Prediction count does not match test data row count.")
     if not np.isfinite(probs).all():
         raise ValueError("The model produced non-finite prediction probabilities.")
 
