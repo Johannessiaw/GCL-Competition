@@ -1,9 +1,0 @@
-Cross-validated blended AUC: 0.756483
-Saved submission to: C:\Users\Johannes\Downloads\Competition-20261009T204349Z-1-001\Competition\output\submission.csv
-Rows: 61500
- SK_ID_CURR   TARGET
-     171202 0.167114
-     171203 0.686737
-     171204 0.625839
-     171205 0.530737
-     171206 0.671323
