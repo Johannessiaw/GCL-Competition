@@ -8,7 +8,8 @@ This project predicts the probability that a loan applicant experiences payment 
 - Five-fold stratified cross-validation with out-of-fold predictions.
 - CatBoost + LightGBM probability blend.
 - Fold-specific LightGBM categorical mappings and validation-based early stopping.
-- Submission checks for row count, identifier order, required columns, and finite predictions.
+- Submission checks for exact column names/order, row count, identifier order, unique IDs, binary training labels, matching train/test feature schemas, and finite predictions.
+- Per-fold and pooled out-of-fold ROC-AUC diagnostics to expose unstable validation folds.
 
 ## Project setup
 
@@ -36,7 +37,7 @@ Use Python 3.10+ (Python 3.11 is a sensible choice for compatibility).
    python final_submission.py
    ```
 
-The generated file is `output/submission.csv`.
+The generated file is `output/submission.csv`. Keep this generated prediction file local rather than committing it to the public repository.
 
 ## Evaluation and improvement
 
@@ -52,6 +53,6 @@ The script prints CatBoost, LightGBM, and blended out-of-fold ROC AUC. Treat thi
 
 ## Known limitations
 
-- Training and validation have not been rerun in this environment because the official `input/train.csv` is absent from the repository.
+- The repository currently contains `input/test.csv` and `input/sample_submission.csv`, but not `input/train.csv`. Training and validation therefore cannot be rerun from this repository alone. Keep all course-provided data local and obtain any missing files through the official course materials.
 - The current blend weights are a starting point, not proven optimal.
 - A higher local AUC does not guarantee a higher public or private leaderboard score.
