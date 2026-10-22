@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -134,17 +134,17 @@ def prepare_model_data(train_df: pd.DataFrame, test_df: pd.DataFrame):
     return X, y, X_test, cat_features
 
 
-def make_lgbm_dataset(df: pd.DataFrame, cat_features: list[str], reference_df: pd.DataFrame | None = None):
+def make_lgbm_dataset(
+    df: pd.DataFrame,
+    cat_features: list[str],
+    category_maps: dict[str, pd.Index],
+) -> pd.DataFrame:
+    """Apply identical categorical ordering to training, validation and test rows."""
     out = df.copy()
-    if not cat_features:
-        return out
-    all_values = pd.concat(
-        [out[col].astype(str) for col in cat_features] + ([reference_df[col].astype(str) for col in cat_features] if reference_df is not None else []),
-        axis=1,
-    )
     for col in cat_features:
-        categories = pd.Index(pd.concat([out[col].astype(str), reference_df[col].astype(str)], ignore_index=True).unique()) if reference_df is not None else pd.Index(out[col].astype(str).unique())
-        out[col] = pd.Categorical(out[col].astype(str), categories=categories)
+        values = out[col].fillna("Missing").astype(str)
+        # Unseen validation/test categories become NaN without shifting category codes.
+        out[col] = pd.Categorical(values, categories=category_maps[col])
     return out
 
 
@@ -182,43 +182,78 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
         cat_oof[idx_valid] = cat_model.predict_proba(X_valid)[:, 1]
         cat_test += cat_model.predict_proba(X_test)[:, 1] / cv.n_splits
 
-        X_train_lgb = make_lgbm_dataset(X_train, cat_features, X_test)
-        X_valid_lgb = make_lgbm_dataset(X_valid, cat_features, X_test)
-        X_test_lgb = make_lgbm_dataset(X_test, cat_features, X_test)
+        # Build category maps from this fold's training rows only, then reuse them.
+        category_maps = {
+            col: pd.Index(sorted(X_train[col].fillna("Missing").astype(str).unique()))
+            for col in cat_features
+        }
+        X_train_lgb = make_lgbm_dataset(X_train, cat_features, category_maps)
+        X_valid_lgb = make_lgbm_dataset(X_valid, cat_features, category_maps)
+        X_test_lgb = make_lgbm_dataset(X_test, cat_features, category_maps)
 
         pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
         lgb_model = LGBMClassifier(
-            n_estimators=2200,
+            n_estimators=3000,
             objective="binary",
             num_leaves=31,
-            learning_rate=0.03,
+            learning_rate=0.025,
             min_child_samples=80,
             subsample=0.9,
+            subsample_freq=1,
             colsample_bytree=0.9,
             reg_alpha=0.1,
             reg_lambda=5.0,
             scale_pos_weight=pos_weight,
             random_state=42,
-            n_jobs=8,
+            n_jobs=4,
             verbosity=-1,
         )
+        fit_kwargs = {
+            "eval_set": [(X_valid_lgb, y_valid)],
+            "eval_metric": "auc",
+            "callbacks": [early_stopping(120, verbose=False), log_evaluation(0)],
+        }
         if cat_features:
-            lgb_model.fit(X_train_lgb, y_train, categorical_feature=cat_features)
+            lgb_model.fit(
+                X_train_lgb, y_train, categorical_feature=cat_features, **fit_kwargs
+            )
         else:
-            lgb_model.fit(X_train_lgb, y_train)
+            lgb_model.fit(X_train_lgb, y_train, **fit_kwargs)
         lgb_oof[idx_valid] = lgb_model.predict_proba(X_valid_lgb)[:, 1]
         lgb_test += lgb_model.predict_proba(X_test_lgb)[:, 1] / cv.n_splits
 
+    cat_auc = roc_auc_score(y, cat_oof)
+    lgb_auc = roc_auc_score(y, lgb_oof)
     blended_oof = 0.55 * cat_oof + 0.45 * lgb_oof
     blended_auc = roc_auc_score(y, blended_oof)
+    print(f"Cross-validated CatBoost AUC: {cat_auc:.6f}")
+    print(f"Cross-validated LightGBM AUC: {lgb_auc:.6f}")
     print(f"Cross-validated blended AUC: {blended_auc:.6f}")
     return 0.55 * cat_test + 0.45 * lgb_test
 
 
 def main():
+    if not TRAIN_PATH.exists():
+        raise FileNotFoundError(
+            f"Training data not found at {TRAIN_PATH}. "
+            "Download the official train.csv and place it in the input/ folder; "
+            "do not commit the dataset to Git."
+        )
+    for required_path in (TEST_PATH, SAMPLE_SUB_PATH):
+        if not required_path.exists():
+            raise FileNotFoundError(f"Required competition file not found: {required_path}")
+
     train_df = pd.read_csv(TRAIN_PATH)
     test_df = pd.read_csv(TEST_PATH)
     sample_submission = pd.read_csv(SAMPLE_SUB_PATH)
+
+    required_train_columns = {"SK_ID_CURR", "TARGET"}
+    if not required_train_columns.issubset(train_df.columns):
+        raise ValueError(f"train.csv must contain columns: {sorted(required_train_columns)}")
+    if "SK_ID_CURR" not in test_df.columns:
+        raise ValueError("test.csv must contain the SK_ID_CURR identifier column")
+    if not {"SK_ID_CURR", "TARGET"}.issubset(sample_submission.columns):
+        raise ValueError("sample_submission.csv must contain SK_ID_CURR and TARGET columns")
 
     train_df = add_engineered_features(train_df)
     test_df = add_engineered_features(test_df)

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model artifacts and logs
+catboost_info/
+lightgbm_logs/
+*.log
+
+# Competition data: do not commit course-provided data
+input/train.csv
+input/test.csv
+input/*.zip
+
+# Generated predictions
+output/submission.csv
