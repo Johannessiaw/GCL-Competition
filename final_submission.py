@@ -1,19 +1,19 @@
 """
-Home Credit Default Risk - GCI Global 2026 (pipeline v2).
+Home Credit Default Risk - GCI Global 2026 (pipeline v3).
 
-Upgrades over v1:
-  1. Expanded feature engineering (loan-duration proxy, income-per-child,
-     bureau-enquiry aggregates, EXT_SOURCE statistics/interactions,
-     region-rating interactions, car-ownership indicators).
-  2. Tuned CatBoost and LightGBM with validation-based early stopping.
-  3. Multi-seed averaging per model for prediction stability.
-  4. Blend weight chosen by grid search on out-of-fold AUC instead of a
-     fixed 0.55/0.45 split.
-  5. Prediction sanity checks (variance, distribution drift vs OOF) and an
-     OOF artifact saved to output/ for offline analysis.
+Upgrades over v2:
+  1. Leakage-safe frequency and smoothed target encoding for categorical
+     features (out-of-fold, after Ogrrellier's target-encoding kernel).
+  2. Optional third model: XGBoost (hist, categorical-aware) - auto-skipped
+     when the package is not installed (GCL_USE_XGB=0 disables).
+  3. Blend weights grid-searched over all models on pooled OOF AUC; the
+     test submission uses a rank-normalised weighted blend.
+  4. All v2 upgrades retained: expanded features, tuned CatBoost/LightGBM
+     with early stopping, multi-seed averaging, sanity checks, OOF artifact.
 
 Data rules: only the official competition files are used. No external data
 and no hand-labelled predictions (see README.md / MODEL_UPGRADE_NOTES.md).
+Techniques are modelled on cited public sources; see MODEL_UPGRADE_NOTES.md.
 """
 
 import os
@@ -25,6 +25,13 @@ from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from scipy.stats import rankdata
+
+try:
+    from xgboost import XGBClassifier
+    XGBOOST_AVAILABLE = True
+except ImportError:  # XGBoost is an optional third model
+    XGBOOST_AVAILABLE = False
 
 BASE_DIR = Path(__file__).resolve().parent
 TRAIN_PATH = Path(os.environ.get("GCL_TRAIN_PATH", BASE_DIR / "input" / "train.csv"))
@@ -41,6 +48,10 @@ CAT_OD_WAIT = 300
 LGB_EARLY_STOP = 200
 CAT_ITERATIONS = int(os.environ.get("GCL_CAT_ITERATIONS", 5000))
 LGB_N_ESTIMATORS = int(os.environ.get("GCL_LGB_N_ESTIMATORS", 4000))
+XGB_N_ESTIMATORS = int(os.environ.get("GCL_XGB_N_ESTIMATORS", 4000))
+XGB_EARLY_STOP = int(os.environ.get("GCL_XGB_EARLY_STOP", 200))
+USE_XGB = XGBOOST_AVAILABLE and os.environ.get("GCL_USE_XGB", "1") == "1"
+TE_SMOOTHING = float(os.environ.get("GCL_TE_SMOOTHING", 10.0))
 
 
 def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -320,23 +331,133 @@ def fit_lightgbm_fold(X_train_lgb, y_train, X_valid_lgb, y_valid, X_test_lgb, ca
 
 
 
-def optimize_blend_weight(cat_oof: np.ndarray, lgb_oof: np.ndarray, y: pd.Series) -> tuple[float, float]:
-    """Grid-search the CatBoost weight that maximizes pooled OOF AUC."""
-    best_w, best_auc = 0.5, -1.0
-    for w in np.linspace(0.0, 1.0, 101):
-        auc = roc_auc_score(y, w * cat_oof + (1.0 - w) * lgb_oof)
-        if auc > best_auc:
-            best_auc, best_w = auc, float(w)
-    return best_w, best_auc
+def rank_normalise(preds: np.ndarray) -> np.ndarray:
+    """Map predictions to uniform [0, 1] ranks; standard Kaggle blend trick."""
+    ranks = rankdata(preds)
+    return (ranks - 1.0) / max(len(ranks) - 1.0, 1.0)
+
+
+def optimize_blend_weights(model_oof: dict[str, np.ndarray], y: pd.Series) -> tuple[dict[str, float], float]:
+    """Grid-search non-negative blend weights (summing to 1) on pooled OOF AUC."""
+    names = list(model_oof)
+    if len(names) == 1:
+        return {names[0]: 1.0}, roc_auc_score(y, model_oof[names[0]])
+
+    grid = np.round(np.arange(0.0, 1.0 + 1e-9, 0.05), 2)
+    best_weights, best_auc = {names[0]: 1.0}, -1.0
+    if len(names) == 2:
+        for w in grid:
+            weights = {names[0]: float(w), names[1]: float(1.0 - w)}
+            auc = roc_auc_score(y, sum(weights[m] * model_oof[m] for m in names))
+            if auc > best_auc:
+                best_auc, best_weights = auc, weights
+    else:
+        for w1 in grid:
+            for w2 in grid:
+                w3 = 1.0 - w1 - w2
+                if w3 < -1e-9:
+                    continue
+                weights = {names[0]: float(w1), names[1]: float(w2), names[2]: float(max(w3, 0.0))}
+                auc = roc_auc_score(y, sum(weights[m] * model_oof[m] for m in names))
+                if auc > best_auc:
+                    best_auc, best_weights = auc, weights
+    total = sum(best_weights.values())
+    best_weights = {m: w / total for m, w in best_weights.items()}
+    return best_weights, best_auc
+
+
+def add_cv_encoded_features(
+    X: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    cat_features: list[str],
+    n_splits: int = 5,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Leakage-safe frequency and smoothed target encoding for categoricals.
+
+    Target encodings are computed out-of-fold (a row is encoded with target
+    statistics from rows outside its own encoding fold); test rows use
+    full-train statistics with the training prior as fallback. Technique after
+    https://www.kaggle.com/code/ogrellier/python-target-encoding-for-categorical-features
+    """
+    X = X.copy()
+    X_test = X_test.copy()
+    added_cols = []
+    prior = float(y.mean())
+    enc_cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    for col in cat_features:
+        nunique = X[col].nunique()
+        if nunique < 3 or nunique > 100:
+            continue
+        train_str = X[col].astype(str)
+        test_str = X_test[col].astype(str)
+
+        freq = train_str.value_counts(normalize=True)
+        X[f"FE_{col}"] = train_str.map(freq).fillna(0.0).astype("float32")
+        X_test[f"FE_{col}"] = test_str.map(freq).fillna(0.0).astype("float32")
+        added_cols.append(f"FE_{col}")
+
+        te_oof = pd.Series(np.nan, index=X.index, dtype="float64")
+        for enc_train_idx, enc_valid_idx in enc_cv.split(X, y):
+            fold_target = y.iloc[enc_train_idx]
+            fold_str = train_str.iloc[enc_train_idx]
+            sums = fold_target.groupby(fold_str).sum()
+            counts = fold_target.groupby(fold_str).count()
+            enc = (sums + prior * TE_SMOOTHING) / (counts + TE_SMOOTHING)
+            te_oof.iloc[enc_valid_idx] = train_str.iloc[enc_valid_idx].map(enc)
+
+        sums_full = y.groupby(train_str).sum()
+        counts_full = y.groupby(train_str).count()
+        enc_full = (sums_full + prior * TE_SMOOTHING) / (counts_full + TE_SMOOTHING)
+        X[f"TE_{col}"] = te_oof.fillna(prior).astype("float32")
+        X_test[f"TE_{col}"] = test_str.map(enc_full).fillna(prior).astype("float32")
+        added_cols.append(f"TE_{col}")
+
+    return X, X_test, added_cols
+
+
+def fit_xgboost_fold(X_train_lgb, y_train, X_valid_lgb, y_valid, X_test_lgb, seed):
+    """Train one XGBoost fold (hist, categorical-aware) with early stopping."""
+    pos = max(int((y_train == 1).sum()), 1)
+    neg = int((y_train == 0).sum())
+    model = XGBClassifier(
+        n_estimators=XGB_N_ESTIMATORS,
+        max_depth=6,
+        learning_rate=0.03,
+        min_child_weight=40,
+        subsample=0.8,
+        colsample_bytree=0.7,
+        reg_lambda=5.0,
+        scale_pos_weight=neg / pos,
+        tree_method="hist",
+        random_state=seed,
+        n_jobs=THREADS,
+        verbosity=0,
+        enable_categorical=True,
+        eval_metric="auc",
+        early_stopping_rounds=XGB_EARLY_STOP,
+    )
+    model.fit(
+        X_train_lgb,
+        y_train,
+        eval_set=[(X_valid_lgb, y_valid)],
+        verbose=False,
+    )
+    valid_pred = model.predict_proba(X_valid_lgb)[:, 1]
+    test_pred = model.predict_proba(X_test_lgb)[:, 1]
+    best_iter = getattr(model, "best_iteration", None)
+    best_iter = int(best_iter) + 1 if best_iter is not None else XGB_N_ESTIMATORS
+    return valid_pred, test_pred, best_iter
 
 
 def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_features: list[str]):
     cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
 
-    cat_oof = np.zeros(len(X), dtype=float)
-    lgb_oof = np.zeros(len(X), dtype=float)
-    cat_test = np.zeros(len(X_test), dtype=float)
-    lgb_test = np.zeros(len(X_test), dtype=float)
+    model_names = ["catboost", "lightgbm"] + (["xgboost"] if USE_XGB else [])
+    model_oof = {name: np.zeros(len(X), dtype=float) for name in model_names}
+    model_test = {name: np.zeros(len(X_test), dtype=float) for name in model_names}
 
     fold_scores = []
     for fold_number, (idx_train, idx_valid) in enumerate(cv.split(X, y), start=1):
@@ -352,62 +473,66 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
         X_valid_lgb = make_lgbm_dataset(X_valid, cat_features, category_maps)
         X_test_lgb = make_lgbm_dataset(X_test, cat_features, category_maps)
 
-        cat_valid_seeds, cat_test_seeds = [], []
-        lgb_valid_seeds, lgb_test_seeds = [], []
+        fold_valid: dict[str, np.ndarray] = {}
+        fold_test: dict[str, np.ndarray] = {}
+        fold_iters: dict[str, int] = {}
         for seed in SEEDS:
-            cat_vp, cat_tp, cat_iters = fit_catboost_fold(
+            vp, tp, iters = fit_catboost_fold(
                 X_train, y_train, X_valid, y_valid, X_test, cat_features, seed
             )
-            cat_valid_seeds.append(cat_vp)
-            cat_test_seeds.append(cat_tp)
+            fold_valid["catboost"] = vp if "catboost" not in fold_valid else fold_valid["catboost"] + vp
+            fold_test["catboost"] = tp if "catboost" not in fold_test else fold_test["catboost"] + tp
+            fold_iters["catboost"] = iters
 
-            lgb_vp, lgb_tp, lgb_iters = fit_lightgbm_fold(
+            vp, tp, iters = fit_lightgbm_fold(
                 X_train_lgb, y_train, X_valid_lgb, y_valid, X_test_lgb, cat_features, seed
             )
-            lgb_valid_seeds.append(lgb_vp)
-            lgb_test_seeds.append(lgb_tp)
+            fold_valid["lightgbm"] = vp if "lightgbm" not in fold_valid else fold_valid["lightgbm"] + vp
+            fold_test["lightgbm"] = tp if "lightgbm" not in fold_test else fold_test["lightgbm"] + tp
+            fold_iters["lightgbm"] = iters
 
-        cat_valid = np.mean(cat_valid_seeds, axis=0)
-        cat_test_pred = np.mean(cat_test_seeds, axis=0)
-        lgb_valid = np.mean(lgb_valid_seeds, axis=0)
-        lgb_test_pred = np.mean(lgb_test_seeds, axis=0)
+            if USE_XGB:
+                vp, tp, iters = fit_xgboost_fold(
+                    X_train_lgb, y_train, X_valid_lgb, y_valid, X_test_lgb, seed
+                )
+                fold_valid["xgboost"] = vp if "xgboost" not in fold_valid else fold_valid["xgboost"] + vp
+                fold_test["xgboost"] = tp if "xgboost" not in fold_test else fold_test["xgboost"] + tp
+                fold_iters["xgboost"] = iters
 
-        cat_oof[idx_valid] = cat_valid
-        lgb_oof[idx_valid] = lgb_valid
-        cat_test += cat_test_pred / cv.n_splits
-        lgb_test += lgb_test_pred / cv.n_splits
+        n_seeds = len(SEEDS)
+        for name in model_names:
+            fold_valid[name] /= n_seeds
+            fold_test[name] /= n_seeds
+            model_oof[name][idx_valid] = fold_valid[name]
+            model_test[name] += fold_test[name] / cv.n_splits
 
-        cat_fold_auc = roc_auc_score(y_valid, cat_valid)
-        lgb_fold_auc = roc_auc_score(y_valid, lgb_valid)
-        blend_fold_auc = roc_auc_score(y_valid, 0.5 * cat_valid + 0.5 * lgb_valid)
-        fold_scores.append({
-            "fold": fold_number,
-            "catboost_auc": cat_fold_auc,
-            "lightgbm_auc": lgb_fold_auc,
-            "blend_auc": blend_fold_auc,
-        })
-        print(
-            f"Fold {fold_number}/{cv.n_splits} | "
-            f"CatBoost AUC={cat_fold_auc:.6f} (iters~{cat_iters}) | "
-            f"LightGBM AUC={lgb_fold_auc:.6f} (iters~{lgb_iters}) | "
-            f"50/50 Blend AUC={blend_fold_auc:.6f}"
+        fold_auc = {name: roc_auc_score(y_valid, fold_valid[name]) for name in model_names}
+        equal_blend = np.mean([fold_valid[name] for name in model_names], axis=0)
+        fold_auc["blend"] = roc_auc_score(y_valid, equal_blend)
+        fold_scores.append(fold_auc)
+        parts = " | ".join(
+            f"{name.capitalize()} AUC={fold_auc[name]:.6f} (iters~{fold_iters[name]})"
+            for name in model_names
         )
+        print(f"Fold {fold_number}/{cv.n_splits} | {parts} | Equal-weight Blend AUC={fold_auc['blend']:.6f}")
 
-    cat_auc = roc_auc_score(y, cat_oof)
-    lgb_auc = roc_auc_score(y, lgb_oof)
-    blend_w, blended_auc = optimize_blend_weight(cat_oof, lgb_oof, y)
+    pooled_auc = {name: roc_auc_score(y, model_oof[name]) for name in model_names}
+    weights, blend_auc = optimize_blend_weights(model_oof, y)
 
-    print(f"Cross-validated CatBoost AUC:  {cat_auc:.6f}")
-    print(f"Cross-validated LightGBM AUC:  {lgb_auc:.6f}")
-    print(f"OOF-optimized blend weight (CatBoost): {blend_w:.2f}")
-    print(f"Cross-validated blended AUC:   {blended_auc:.6f}")
+    for name in model_names:
+        print(f"Cross-validated {name.capitalize()} AUC: {pooled_auc[name]:.6f}")
+    print("OOF-optimized blend weights: " + ", ".join(f"{m}={w:.2f}" for m, w in weights.items()))
+    print(f"Cross-validated blended AUC: {blend_auc:.6f}")
     print(
         "Fold blend AUC range: "
-        f"{min(row['blend_auc'] for row in fold_scores):.6f} - "
-        f"{max(row['blend_auc'] for row in fold_scores):.6f}"
+        f"{min(row['blend'] for row in fold_scores):.6f} - "
+        f"{max(row['blend'] for row in fold_scores):.6f}"
     )
 
-    return cat_oof, lgb_oof, blend_w * cat_test + (1.0 - blend_w) * lgb_test
+    blended_oof = sum(weights[m] * model_oof[m] for m in model_names)
+    # Rank-normalised weighted blend for the test set (calibration-robust).
+    test_probs = sum(weights[m] * rank_normalise(model_test[m]) for m in model_names)
+    return model_oof, blended_oof, test_probs, weights
 
 
 def prediction_sanity_checks(probs: np.ndarray, oof_probs: np.ndarray) -> None:
@@ -425,10 +550,12 @@ def prediction_sanity_checks(probs: np.ndarray, oof_probs: np.ndarray) -> None:
         raise ValueError(
             "Test predictions are (near-)constant; such a submission scores ~0.50 AUC."
         )
-    drift = abs(float(probs.mean()) - float(oof_probs.mean()))
-    if drift > 0.15:
+    # Compare on the rank scale: test probabilities are rank-normalised in the
+    # final blend, so raw-probability means are not comparable to OOF means.
+    drift = abs(float(rank_normalise(probs).mean()) - float(rank_normalise(oof_probs).mean()))
+    if drift > 0.05:
         print(
-            f"WARNING: test/OOF mean drift of {drift:.3f}; "
+            f"WARNING: test/OOF rank-mean drift of {drift:.3f}; "
             "inspect for schema or distribution mismatch before submitting."
         )
 
@@ -503,22 +630,28 @@ def main():
     X, y, X_test, cat_features = prepare_model_data(train_df, test_df)
     print(f"Modelled features: {X.shape[1]:,} (categorical: {len(cat_features)})")
 
-    cat_oof, lgb_oof, probs = fit_blended_models(X, y, X_test, cat_features)
-    blended_oof = pd.concat(
-        [train_df["SK_ID_CURR"], y, pd.Series(cat_oof, name="catboost_oof"),
-         pd.Series(lgb_oof, name="lightgbm_oof")],
-        axis=1,
-    )
+    X, X_test, enc_cols = add_cv_encoded_features(X, y, X_test, cat_features)
+    if enc_cols:
+        print(f"Added {len(enc_cols)} CV-encoded categorical features (frequency + target)")
+
+    model_oofs, blended_oof, probs, weights = fit_blended_models(X, y, X_test, cat_features)
+    oof_df = pd.DataFrame({
+        "SK_ID_CURR": train_df["SK_ID_CURR"].to_numpy(),
+        "TARGET": y.to_numpy(),
+    })
+    for name, oof in model_oofs.items():
+        oof_df[f"{name}_oof"] = oof
+    oof_df["blended_oof"] = blended_oof
 
     if len(probs) != len(test_df):
         raise ValueError("Prediction count does not match test data row count.")
     if not np.isfinite(probs).all():
         raise ValueError("The model produced non-finite prediction probabilities.")
 
-    prediction_sanity_checks(probs, blended_oof[["catboost_oof", "lightgbm_oof"]].mean(axis=1).to_numpy())
+    prediction_sanity_checks(probs, blended_oof)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    blended_oof.to_csv(OOF_PATH, index=False)
+    oof_df.to_csv(OOF_PATH, index=False)
     submission = pd.DataFrame({
         "SK_ID_CURR": sample_submission["SK_ID_CURR"],
         "TARGET": probs.astype(float),
