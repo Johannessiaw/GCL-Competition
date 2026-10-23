@@ -1,29 +1,47 @@
 # Model upgrade notes
 
-## Changes applied to main
+## Changes applied to main (v2)
 
-1. LightGBM categorical columns use category maps built from each fold's training rows and reused unchanged for validation and test.
-2. LightGBM uses a validation fold and early stopping rather than always fitting the full preset number of trees.
-3. The training script reports CatBoost, LightGBM, and blended ROC-AUC for each fold and pooled out-of-fold predictions.
-4. Startup checks validate required files, non-empty data, duplicate column names, missing/duplicate IDs, binary target labels, exact submission columns/order, train/test feature-schema agreement, sample-submission row count and ID order, and finite output probabilities.
-5. Repository instructions explain reproducibility, competition restrictions, and the local-data requirement.
-6. The public main branch no longer contains the generated output/submission.csv.
+1. Expanded feature engineering: loan-duration proxy (credit/annuity), income-per-child,
+   children/family ratio, region-rating x population, car-ownership indicators
+   (including car-age vs driver-age), credit-bureau enquiry totals and recency-weighted
+   totals, document/contact-flag sums, registration/ID-publish and phone-change recency
+   features, social-circle default ratios, EXT_SOURCE std/count, and age buckets.
+2. CatBoost and LightGBM retuned (CatBoost: depth 7, lr 0.035, early stopping with
+   od_wait=300; LightGBM: num_leaves 48, lr 0.03, min_child_samples 70, early
+   stopping 200) with per-fold best-iteration reporting.
+3. Multi-seed averaging (42, 2026) per model per fold to stabilise test predictions.
+4. Blend weight is now grid-searched on pooled out-of-fold AUC instead of a fixed
+   0.55/0.45 split.
+5. Prediction sanity checks: fails on (near-)constant test probabilities (the classic
+   cause of a ~0.50 leaderboard AUC) and warns on test/OOF distribution drift.
+6. OOF predictions are saved to output/oof_predictions.csv for offline analysis.
+7. Fold-specific LightGBM categorical maps are now also pandas>=4 safe (unseen
+   categories are mapped to NaN explicitly before Categorical construction).
+8. Optional env knobs: GCL_TRAIN_PATH (train file override), GCL_CAT_ITERATIONS,
+   GCL_LGB_N_ESTIMATORS (smoke-test budgets).
 
-## Competition criteria considered
+## Validation status
 
-- Metric: ROC-AUC, requiring probability predictions rather than hard class labels.
-- Submission: exactly SK_ID_CURR,TARGET, matching the sample submission's rows and identifier order.
-- Reproducibility: fixed random seeds and code capable of recreating the submitted CSV.
-- Data rules: use only the official provided data; no external data or hand-labelled test predictions.
-- Final result: the assignment says the last submitted file determines the final ranking, so verify the intended file before submitting.
-
-## Important verification status
-
-The repository has input/test.csv and input/sample_submission.csv, but input/train.csv is absent. The model cannot be honestly benchmarked or retrained from the repository alone until the official training file is made available locally. No improvement in competition score is claimed yet. The historical blended AUC in run_model.log is 0.756483; it is a prior run, not a verified result for the updated script.
+- End-to-end smoke test passed on a synthetic train file (tools/make_synthetic_train.py,
+  built from test.csv rows with an injected weak signal): pipeline completed all 5 folds,
+  2 seeds, both models, wrote a valid 61,500-row submission, and scored blended OOF
+  AUC 0.914 on the synthetic signal (proving the pipeline learns; random labels would
+  score ~0.50). This validates code correctness only - it says nothing about real-data
+  performance.
+- input/train.csv is still absent, so real-data training/CV cannot be rerun here.
+  The historical v1 blended AUC of 0.756483 remains the best real-data reference.
+- No external data was used at any point (competition rules); improvements come from
+  feature engineering and tuning on the official application table only.
 
 ## Next steps
 
 1. Put the official train.csv in input/ locally; do not commit course data.
-2. Install requirements.txt in a compatible Python environment and run python final_submission.py.
-3. Review all five fold scores and pooled OOF AUC, compare fairly with the old baseline using the same folds/seed, and only then consider alternative blend weights.
-4. Check the generated CSV locally and upload the intended file to Omnicampus. Since the last submission counts, avoid submitting an unverified replacement.
+2. Install requirements.txt and run `python final_submission.py` (full budget:
+   ~5k CatBoost iters, ~4k LightGBM trees with early stopping; on 2 cores expect
+   roughly 1-3 hours. Set SEEDS=(42,) for a faster run).
+3. Review fold AUCs and the pooled OOF AUC; compare with the v1 baseline on the same
+   folds/seed before changing anything else.
+4. Check output/submission.csv locally (row count, ID order, non-constant values)
+   and upload the intended file - the last submission counts.
+

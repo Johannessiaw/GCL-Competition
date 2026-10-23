@@ -1,3 +1,22 @@
+"""
+Home Credit Default Risk - GCI Global 2026 (pipeline v2).
+
+Upgrades over v1:
+  1. Expanded feature engineering (loan-duration proxy, income-per-child,
+     bureau-enquiry aggregates, EXT_SOURCE statistics/interactions,
+     region-rating interactions, car-ownership indicators).
+  2. Tuned CatBoost and LightGBM with validation-based early stopping.
+  3. Multi-seed averaging per model for prediction stability.
+  4. Blend weight chosen by grid search on out-of-fold AUC instead of a
+     fixed 0.55/0.45 split.
+  5. Prediction sanity checks (variance, distribution drift vs OOF) and an
+     OOF artifact saved to output/ for offline analysis.
+
+Data rules: only the official competition files are used. No external data
+and no hand-labelled predictions (see README.md / MODEL_UPGRADE_NOTES.md).
+"""
+
+import os
 from pathlib import Path
 
 import numpy as np
@@ -8,11 +27,20 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 BASE_DIR = Path(__file__).resolve().parent
-TRAIN_PATH = BASE_DIR / "input" / "train.csv"
+TRAIN_PATH = Path(os.environ.get("GCL_TRAIN_PATH", BASE_DIR / "input" / "train.csv"))
 TEST_PATH = BASE_DIR / "input" / "test.csv"
 SAMPLE_SUB_PATH = BASE_DIR / "input" / "sample_submission.csv"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_PATH = OUTPUT_DIR / "submission.csv"
+OOF_PATH = OUTPUT_DIR / "oof_predictions.csv"
+
+N_SPLITS = 5
+SEEDS = (42, 2026)  # set to (42,) for a faster run
+THREADS = max(1, min(8, os.cpu_count() or 2))
+CAT_OD_WAIT = 300
+LGB_EARLY_STOP = 200
+CAT_ITERATIONS = int(os.environ.get("GCL_CAT_ITERATIONS", 5000))
+LGB_N_ESTIMATORS = int(os.environ.get("GCL_LGB_N_ESTIMATORS", 4000))
 
 
 def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -34,8 +62,10 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         "DAYS_REGISTRATION",
         "DAYS_ID_PUBLISH",
         "DAYS_LAST_PHONE_CHANGE",
+        "CNT_CHILDREN",
         "CNT_FAM_MEMBERS",
         "REGION_POPULATION_RELATIVE",
+        "REGION_RATING_CLIENT",
         "OBS_30_CNT_SOCIAL_CIRCLE",
         "DEF_30_CNT_SOCIAL_CIRCLE",
         "OBS_60_CNT_SOCIAL_CIRCLE",
@@ -44,7 +74,6 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     ratios = [
         ("AMT_CREDIT_AMT_INCOME_RATIO", "AMT_CREDIT", "AMT_INCOME_TOTAL"),
         ("AMT_ANNUITY_AMT_CREDIT_RATIO", "AMT_ANNUITY", "AMT_CREDIT"),
@@ -53,6 +82,8 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         ("AMT_GOODS_PRICE_AMT_INCOME_RATIO", "AMT_GOODS_PRICE", "AMT_INCOME_TOTAL"),
         ("DAYS_EMPLOYED_DAYS_BIRTH_RATIO", "DAYS_EMPLOYED", "DAYS_BIRTH"),
         ("AMT_INCOME_TOTAL_PER_FAMILY_MEMBER", "AMT_INCOME_TOTAL", "CNT_FAM_MEMBERS"),
+        ("DAYS_REGISTRATION_DAYS_BIRTH_RATIO", "DAYS_REGISTRATION", "DAYS_BIRTH"),
+        ("DAYS_ID_PUBLISH_DAYS_BIRTH_RATIO", "DAYS_ID_PUBLISH", "DAYS_BIRTH"),
     ]
     for new_col, num_col, den_col in ratios:
         if num_col in df.columns and den_col in df.columns:
@@ -71,16 +102,8 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         df["EXT_SOURCE_MAX"] = df[ext_source_cols].max(axis=1, skipna=True)
         df["EXT_SOURCE_MIN"] = df[ext_source_cols].min(axis=1, skipna=True)
         df["EXT_SOURCE_SUM"] = df[ext_source_cols].sum(axis=1, skipna=True)
-
-    for col, feature_name in [
-        ("DAYS_BIRTH", "AGE_YEARS"),
-        ("DAYS_EMPLOYED", "YEARS_EMPLOYED"),
-        ("DAYS_REGISTRATION", "YEARS_REGISTRATION"),
-        ("DAYS_ID_PUBLISH", "YEARS_ID_PUBLISH"),
-        ("DAYS_LAST_PHONE_CHANGE", "YEARS_PHONE_CHANGE"),
-    ]:
-        if col in df.columns:
-            df[feature_name] = -df[col] / 365.25
+        df["EXT_SOURCE_STD"] = df[ext_source_cols].std(axis=1, skipna=True)
+        df["EXT_SOURCE_COUNT"] = df[ext_source_cols].notna().sum(axis=1)
 
     for left, right in [
         ("EXT_SOURCE_1", "EXT_SOURCE_2"),
@@ -110,6 +133,93 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[f"{col}_LOG1P"] = np.log1p(df[col].clip(lower=0))
 
+    # ---- v2 additions -------------------------------------------------
+    # Loan-duration proxy: how many annuity payments the credit implies.
+    if {"AMT_CREDIT", "AMT_ANNUITY"}.issubset(df.columns):
+        df["CREDIT_DIV_ANNUITY_MONTHS"] = (
+            df["AMT_CREDIT"] / df["AMT_ANNUITY"].replace(0, np.nan)
+        )
+
+    # Household structure.
+    if {"AMT_INCOME_TOTAL", "CNT_CHILDREN"}.issubset(df.columns):
+        df["INCOME_PER_CHILD"] = df["AMT_INCOME_TOTAL"] / (df["CNT_CHILDREN"] + 1)
+    if {"CNT_CHILDREN", "CNT_FAM_MEMBERS"}.issubset(df.columns):
+        df["CHILDREN_FAMILY_RATIO"] = (
+            df["CNT_CHILDREN"] / df["CNT_FAM_MEMBERS"].replace(0, np.nan)
+        )
+
+    # Region rating interactions.
+    if {"REGION_RATING_CLIENT", "REGION_POPULATION_RELATIVE"}.issubset(df.columns):
+        df["REGION_RATING_X_POPULATION"] = (
+            df["REGION_RATING_CLIENT"] * df["REGION_POPULATION_RELATIVE"]
+        )
+
+    # Car ownership indicators.
+    if "OWN_CAR_AGE" in df.columns:
+        df["OWN_CAR_AGE_MISSING"] = df["OWN_CAR_AGE"].isna().astype("int8")
+        if "DAYS_BIRTH" in df.columns:
+            driver_age = (-df["DAYS_BIRTH"] / 365.25).replace(0, np.nan)
+            df["CAR_AGE_VS_DRIVER_AGE"] = df["OWN_CAR_AGE"] / driver_age
+
+    # Credit-bureau enquiry aggregates (recent enquiries weighted higher).
+    bureau_cols = [c for c in df.columns if c.startswith("AMT_REQ_CREDIT_BUREAU")]
+    if bureau_cols:
+        df["BUREAU_ENQUIRIES_TOTAL"] = df[bureau_cols].sum(axis=1, skipna=True)
+        recency_weights = {"HOUR": 16, "MON": 8, "QRT": 4, "YEAR": 1}
+        weighted = None
+        for suffix, weight in recency_weights.items():
+            col = f"AMT_REQ_CREDIT_BUREAU_{suffix}"
+            if col in df.columns:
+                term = weight * pd.to_numeric(df[col], errors="coerce").fillna(0)
+                weighted = term if weighted is None else weighted + term
+        if weighted is not None:
+            df["BUREAU_ENQUIRIES_RECENCY_WEIGHTED"] = weighted
+
+    # Document and contact-channel counts when present.
+    flag_cols = [c for c in df.columns if c.startswith("FLAG_DOCUMENT_")]
+    if flag_cols:
+        df["DOCUMENT_FLAGS_SUM"] = df[flag_cols].sum(axis=1)
+    contact_cols = [
+        c
+        for c in [
+            "FLAG_MOBIL",
+            "FLAG_EMP_PHONE",
+            "FLAG_WORK_PHONE",
+            "FLAG_CONT_MOBILE",
+            "FLAG_PHONE",
+            "FLAG_EMAIL",
+        ]
+        if c in df.columns
+    ]
+    if contact_cols:
+        df["CONTACT_CHANNELS_SUM"] = df[contact_cols].sum(axis=1)
+
+    # Recency features.
+    if {"DAYS_REGISTRATION", "DAYS_ID_PUBLISH"}.issubset(df.columns):
+        df["REGISTRATION_MINUS_ID_PUBLISH"] = df["DAYS_REGISTRATION"] - df["DAYS_ID_PUBLISH"]
+    if {"DAYS_LAST_PHONE_CHANGE", "DAYS_BIRTH"}.issubset(df.columns):
+        df["PHONE_CHANGE_PER_YEAR_OF_AGE"] = (
+            (-df["DAYS_LAST_PHONE_CHANGE"] / 365.25)
+            / (-df["DAYS_BIRTH"] / 365.25).replace(0, np.nan)
+        )
+
+    # Social-circle default ratios when present.
+    if {"DEF_30_CNT_SOCIAL_CIRCLE", "OBS_30_CNT_SOCIAL_CIRCLE"}.issubset(df.columns):
+        df["DEF_30_PER_OBS_30"] = (
+            df["DEF_30_CNT_SOCIAL_CIRCLE"] / df["OBS_30_CNT_SOCIAL_CIRCLE"].replace(0, np.nan)
+        )
+    if {"DEF_60_CNT_SOCIAL_CIRCLE", "OBS_60_CNT_SOCIAL_CIRCLE"}.issubset(df.columns):
+        df["DEF_60_PER_OBS_60"] = (
+            df["DEF_60_CNT_SOCIAL_CIRCLE"] / df["OBS_60_CNT_SOCIAL_CIRCLE"].replace(0, np.nan)
+        )
+
+    # Age buckets.
+    if "DAYS_BIRTH" in df.columns:
+        age_years = -df["DAYS_BIRTH"] / 365.25
+        df["AGE_YEARS"] = age_years
+        df["AGE_UNDER_30"] = (age_years < 30).astype("int8")
+        df["AGE_OVER_55"] = (age_years > 55).astype("int8")
+
     for col in df.select_dtypes(include=["object", "string"]).columns:
         df[col] = df[col].fillna("Missing")
 
@@ -124,12 +234,10 @@ def prepare_model_data(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
     for col in X.columns:
         if X[col].dtype == "object":
-            X[col] = X[col].fillna("Missing")
-            X_test[col] = X_test[col].fillna("Missing")
+            X[col] = X[col].fillna("Missing").astype(str)
+            X_test[col] = X_test[col].fillna("Missing").astype(str)
 
     cat_features = list(X.select_dtypes(include=["object", "string"]).columns)
-    if not cat_features:
-        cat_features = []
 
     return X, y, X_test, cat_features
 
@@ -143,13 +251,87 @@ def make_lgbm_dataset(
     out = df.copy()
     for col in cat_features:
         values = out[col].fillna("Missing").astype(str)
-        # Unseen validation/test categories become NaN without shifting category codes.
-        out[col] = pd.Categorical(values, categories=category_maps[col])
+        # Unseen validation/test categories become NaN without shifting codes.
+        # Map first so pandas>=4 does not raise on out-of-category values.
+        mapped = values.where(values.isin(category_maps[col]))
+        out[col] = pd.Categorical(mapped, categories=category_maps[col])
     return out
 
 
+def fit_catboost_fold(X_train, y_train, X_valid, y_valid, X_test, cat_features, seed):
+    """Train one CatBoost fold with early stopping; return valid/test probabilities."""
+    model = CatBoostClassifier(
+        iterations=CAT_ITERATIONS,
+        depth=7,
+        learning_rate=0.035,
+        l2_leaf_reg=3.0,
+        loss_function="Logloss",
+        eval_metric="AUC",
+        random_seed=seed,
+        verbose=False,
+        allow_writing_files=False,
+        cat_features=cat_features or None,
+        auto_class_weights="Balanced",
+        subsample=0.9,
+        colsample_bylevel=0.9,
+        thread_count=THREADS,
+        od_type="Iter",
+        od_wait=CAT_OD_WAIT,
+    )
+    model.fit(X_train, y_train, eval_set=(X_valid, y_valid), use_best_model=True)
+    valid_pred = model.predict_proba(X_valid)[:, 1]
+    test_pred = model.predict_proba(X_test)[:, 1]
+    best_iter = (model.get_best_iteration() or 0) + 1
+    return valid_pred, test_pred, best_iter
+
+
+def fit_lightgbm_fold(X_train_lgb, y_train, X_valid_lgb, y_valid, X_test_lgb, cat_features, seed):
+    """Train one LightGBM fold with early stopping; return valid/test probabilities."""
+    pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+    model = LGBMClassifier(
+        n_estimators=LGB_N_ESTIMATORS,
+        objective="binary",
+        num_leaves=48,
+        learning_rate=0.03,
+        min_child_samples=70,
+        subsample=0.85,
+        subsample_freq=1,
+        colsample_bytree=0.85,
+        reg_alpha=0.05,
+        reg_lambda=10.0,
+        scale_pos_weight=pos_weight,
+        random_state=seed,
+        n_jobs=THREADS,
+        verbosity=-1,
+    )
+    fit_kwargs = {
+        "eval_set": [(X_valid_lgb, y_valid)],
+        "eval_metric": "auc",
+        "callbacks": [early_stopping(LGB_EARLY_STOP, verbose=False), log_evaluation(0)],
+    }
+    if cat_features:
+        model.fit(X_train_lgb, y_train, categorical_feature=cat_features, **fit_kwargs)
+    else:
+        model.fit(X_train_lgb, y_train, **fit_kwargs)
+    valid_pred = model.predict_proba(X_valid_lgb)[:, 1]
+    test_pred = model.predict_proba(X_test_lgb)[:, 1]
+    best_iter = getattr(model, "best_iteration_", None) or LGB_N_ESTIMATORS
+    return valid_pred, test_pred, best_iter
+
+
+
+def optimize_blend_weight(cat_oof: np.ndarray, lgb_oof: np.ndarray, y: pd.Series) -> tuple[float, float]:
+    """Grid-search the CatBoost weight that maximizes pooled OOF AUC."""
+    best_w, best_auc = 0.5, -1.0
+    for w in np.linspace(0.0, 1.0, 101):
+        auc = roc_auc_score(y, w * cat_oof + (1.0 - w) * lgb_oof)
+        if auc > best_auc:
+            best_auc, best_w = auc, float(w)
+    return best_w, best_auc
+
+
 def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_features: list[str]):
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
 
     cat_oof = np.zeros(len(X), dtype=float)
     lgb_oof = np.zeros(len(X), dtype=float)
@@ -161,31 +343,7 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
         X_train, X_valid = X.iloc[idx_train].copy(), X.iloc[idx_valid].copy()
         y_train, y_valid = y.iloc[idx_train].copy(), y.iloc[idx_valid].copy()
 
-        cat_model = CatBoostClassifier(
-            iterations=1400,
-            depth=8,
-            learning_rate=0.03,
-            l2_leaf_reg=2.5,
-            loss_function="Logloss",
-            eval_metric="AUC",
-            random_seed=42,
-            verbose=False,
-            allow_writing_files=False,
-            cat_features=cat_features if cat_features else None,
-            auto_class_weights="Balanced",
-            subsample=0.9,
-            colsample_bylevel=0.9,
-            thread_count=8,
-            od_type="Iter",
-            od_wait=60,
-        )
-        cat_model.fit(X_train, y_train, eval_set=(X_valid, y_valid), early_stopping_rounds=120, verbose=False)
-        cat_valid_pred = cat_model.predict_proba(X_valid)[:, 1]
-        cat_oof[idx_valid] = cat_valid_pred
-        cat_test += cat_model.predict_proba(X_test)[:, 1] / cv.n_splits
-        cat_fold_auc = roc_auc_score(y_valid, cat_valid_pred)
-
-        # Build category maps from this fold's training rows only, then reuse them.
+        # Category maps built from this fold's training rows only, then reused.
         category_maps = {
             col: pd.Index(sorted(X_train[col].fillna("Missing").astype(str).unique()))
             for col in cat_features
@@ -194,39 +352,34 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
         X_valid_lgb = make_lgbm_dataset(X_valid, cat_features, category_maps)
         X_test_lgb = make_lgbm_dataset(X_test, cat_features, category_maps)
 
-        pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-        lgb_model = LGBMClassifier(
-            n_estimators=3000,
-            objective="binary",
-            num_leaves=31,
-            learning_rate=0.025,
-            min_child_samples=80,
-            subsample=0.9,
-            subsample_freq=1,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=5.0,
-            scale_pos_weight=pos_weight,
-            random_state=42,
-            n_jobs=4,
-            verbosity=-1,
-        )
-        fit_kwargs = {
-            "eval_set": [(X_valid_lgb, y_valid)],
-            "eval_metric": "auc",
-            "callbacks": [early_stopping(120, verbose=False), log_evaluation(0)],
-        }
-        if cat_features:
-            lgb_model.fit(
-                X_train_lgb, y_train, categorical_feature=cat_features, **fit_kwargs
+        cat_valid_seeds, cat_test_seeds = [], []
+        lgb_valid_seeds, lgb_test_seeds = [], []
+        for seed in SEEDS:
+            cat_vp, cat_tp, cat_iters = fit_catboost_fold(
+                X_train, y_train, X_valid, y_valid, X_test, cat_features, seed
             )
-        else:
-            lgb_model.fit(X_train_lgb, y_train, **fit_kwargs)
-        lgb_valid_pred = lgb_model.predict_proba(X_valid_lgb)[:, 1]
-        lgb_oof[idx_valid] = lgb_valid_pred
-        lgb_test += lgb_model.predict_proba(X_test_lgb)[:, 1] / cv.n_splits
-        lgb_fold_auc = roc_auc_score(y_valid, lgb_valid_pred)
-        blend_fold_auc = roc_auc_score(y_valid, 0.55 * cat_valid_pred + 0.45 * lgb_valid_pred)
+            cat_valid_seeds.append(cat_vp)
+            cat_test_seeds.append(cat_tp)
+
+            lgb_vp, lgb_tp, lgb_iters = fit_lightgbm_fold(
+                X_train_lgb, y_train, X_valid_lgb, y_valid, X_test_lgb, cat_features, seed
+            )
+            lgb_valid_seeds.append(lgb_vp)
+            lgb_test_seeds.append(lgb_tp)
+
+        cat_valid = np.mean(cat_valid_seeds, axis=0)
+        cat_test_pred = np.mean(cat_test_seeds, axis=0)
+        lgb_valid = np.mean(lgb_valid_seeds, axis=0)
+        lgb_test_pred = np.mean(lgb_test_seeds, axis=0)
+
+        cat_oof[idx_valid] = cat_valid
+        lgb_oof[idx_valid] = lgb_valid
+        cat_test += cat_test_pred / cv.n_splits
+        lgb_test += lgb_test_pred / cv.n_splits
+
+        cat_fold_auc = roc_auc_score(y_valid, cat_valid)
+        lgb_fold_auc = roc_auc_score(y_valid, lgb_valid)
+        blend_fold_auc = roc_auc_score(y_valid, 0.5 * cat_valid + 0.5 * lgb_valid)
         fold_scores.append({
             "fold": fold_number,
             "catboost_auc": cat_fold_auc,
@@ -235,24 +388,50 @@ def fit_blended_models(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, cat_
         })
         print(
             f"Fold {fold_number}/{cv.n_splits} | "
-            f"CatBoost AUC={cat_fold_auc:.6f} | "
-            f"LightGBM AUC={lgb_fold_auc:.6f} | "
-            f"Blend AUC={blend_fold_auc:.6f}"
+            f"CatBoost AUC={cat_fold_auc:.6f} (iters~{cat_iters}) | "
+            f"LightGBM AUC={lgb_fold_auc:.6f} (iters~{lgb_iters}) | "
+            f"50/50 Blend AUC={blend_fold_auc:.6f}"
         )
 
     cat_auc = roc_auc_score(y, cat_oof)
     lgb_auc = roc_auc_score(y, lgb_oof)
-    blended_oof = 0.55 * cat_oof + 0.45 * lgb_oof
-    blended_auc = roc_auc_score(y, blended_oof)
-    print(f"Cross-validated CatBoost AUC: {cat_auc:.6f}")
-    print(f"Cross-validated LightGBM AUC: {lgb_auc:.6f}")
-    print(f"Cross-validated blended AUC: {blended_auc:.6f}")
+    blend_w, blended_auc = optimize_blend_weight(cat_oof, lgb_oof, y)
+
+    print(f"Cross-validated CatBoost AUC:  {cat_auc:.6f}")
+    print(f"Cross-validated LightGBM AUC:  {lgb_auc:.6f}")
+    print(f"OOF-optimized blend weight (CatBoost): {blend_w:.2f}")
+    print(f"Cross-validated blended AUC:   {blended_auc:.6f}")
     print(
         "Fold blend AUC range: "
         f"{min(row['blend_auc'] for row in fold_scores):.6f} - "
         f"{max(row['blend_auc'] for row in fold_scores):.6f}"
     )
-    return 0.55 * cat_test + 0.45 * lgb_test
+
+    return cat_oof, lgb_oof, blend_w * cat_test + (1.0 - blend_w) * lgb_test
+
+
+def prediction_sanity_checks(probs: np.ndarray, oof_probs: np.ndarray) -> None:
+    """Fail loudly on degenerate predictions; warn on test/OOF distribution drift."""
+    std = float(np.std(probs))
+    print(
+        f"Test prediction stats: mean={probs.mean():.5f} std={std:.5f} "
+        f"min={probs.min():.5f} max={probs.max():.5f}"
+    )
+    print(
+        f"OOF prediction stats:  mean={float(oof_probs.mean()):.5f} "
+        f"std={float(oof_probs.std()):.5f}"
+    )
+    if std < 1e-6:
+        raise ValueError(
+            "Test predictions are (near-)constant; such a submission scores ~0.50 AUC."
+        )
+    drift = abs(float(probs.mean()) - float(oof_probs.mean()))
+    if drift > 0.15:
+        print(
+            f"WARNING: test/OOF mean drift of {drift:.3f}; "
+            "inspect for schema or distribution mismatch before submitting."
+        )
+
 
 
 def main():
@@ -309,33 +488,53 @@ def main():
             f"extra in test: {extra_test[:10]}"
         )
 
+    print(f"Training data: {TRAIN_PATH}")
     print(f"Training rows: {len(train_df):,}; test rows: {len(test_df):,}")
     print(f"Input feature columns: {len(train_features):,}")
     print(f"Default rate: {train_df['TARGET'].mean():.6%}")
-    print("Validation: 5-fold stratified CV, shuffle=True, random_state=42")
+    print(
+        f"Validation: {N_SPLITS}-fold stratified CV, shuffle=True, random_state=42; "
+        f"seeds per model: {SEEDS}"
+    )
 
     train_df = add_engineered_features(train_df)
     test_df = add_engineered_features(test_df)
 
     X, y, X_test, cat_features = prepare_model_data(train_df, test_df)
-    probs = fit_blended_models(X, y, X_test, cat_features)
+    print(f"Modelled features: {X.shape[1]:,} (categorical: {len(cat_features)})")
+
+    cat_oof, lgb_oof, probs = fit_blended_models(X, y, X_test, cat_features)
+    blended_oof = pd.concat(
+        [train_df["SK_ID_CURR"], y, pd.Series(cat_oof, name="catboost_oof"),
+         pd.Series(lgb_oof, name="lightgbm_oof")],
+        axis=1,
+    )
 
     if len(probs) != len(test_df):
         raise ValueError("Prediction count does not match test data row count.")
     if not np.isfinite(probs).all():
         raise ValueError("The model produced non-finite prediction probabilities.")
 
+    prediction_sanity_checks(probs, blended_oof[["catboost_oof", "lightgbm_oof"]].mean(axis=1).to_numpy())
+
     OUTPUT_DIR.mkdir(exist_ok=True)
+    blended_oof.to_csv(OOF_PATH, index=False)
     submission = pd.DataFrame({
         "SK_ID_CURR": sample_submission["SK_ID_CURR"],
         "TARGET": probs.astype(float),
     })
     submission.to_csv(OUTPUT_PATH, index=False)
 
+    print("Saved OOF predictions to:", OOF_PATH)
     print("Saved submission to:", OUTPUT_PATH)
     print(f"Rows: {len(submission)}")
     print(submission.head().to_string(index=False))
+    print("Reminder: verify this is the intended file before uploading - the last submission counts.")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+

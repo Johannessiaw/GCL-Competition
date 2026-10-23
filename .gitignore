@@ -19,7 +19,9 @@ lightgbm_logs/
 # Competition data: do not commit course-provided data
 input/train.csv
 input/test.csv
+input/train_synthetic.csv
 input/*.zip
 
 # Generated predictions
 output/submission.csv
+output/oof_predictions.csv
