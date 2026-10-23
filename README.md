@@ -39,6 +39,8 @@ Use Python 3.10+ (Python 3.11 is a sensible choice for compatibility).
 
 The generated file is `output/submission.csv`. Keep this generated prediction file local rather than committing it to the public repository.
 
+> ⚠️ **Exception currently in effect:** a copy of `output/submission.csv` IS committed in this repository (owner request) as a pipeline artifact. It was produced with `GCL_TRAIN_PATH=input/train_synthetic.csv` because the official `input/train.csv` is unavailable in this workspace — its labels are synthetic, so this file will score ~0.50 AUC and **must not be submitted to the competition**. Regenerate it with the official `train.csv` before uploading anything.
+
 ## Evaluation and improvement
 
 The script prints CatBoost, LightGBM, and blended out-of-fold ROC AUC. Treat this as a local validation estimate, not a guarantee of leaderboard performance. Compare experiments using the same folds and seeds. Do not choose model settings by repeatedly optimizing against the public leaderboard.

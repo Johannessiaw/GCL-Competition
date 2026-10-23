@@ -22,6 +22,9 @@ input/test.csv
 input/train_synthetic.csv
 input/*.zip
 
-# Generated predictions
-output/submission.csv
+# Generated predictions.
+# NOTE: output/submission.csv IS committed on request of the repo owner as a
+# pipeline artifact. It was trained on tools/make_synthetic_train.py labels
+# (input/train.csv is unavailable in this workspace) and will score ~0.50 AUC.
+# Regenerate with the official train.csv before any real submission.
 output/oof_predictions.csv
